@@ -1,15 +1,19 @@
 [package]
-name = "rustrtc"
-version = "0.4.20"
+name = "fork-rustrtc"
+version = "0.4.21-preview"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
-repository = "https://github.com/restsend/rustrtc"
-description = "A high-performance real-time communication library — WebRTC, RTP/SRTP, T.38 Fax, and RTP Latching"
+repository = "https://github.com/dengxiayehu/rustrtc"
+description = "Preview fork of rustrtc with complete packet-stage transport stats and diagnostics compatibility"
 readme = "README.md"
 keywords = ["rtp", "srtp", "webrtc", "fax", "turn"]
 categories = ["network-programming"]
 license = "MIT"
 exclude = ["flamegraph.svg","examples", "tests", "rustrtc_sfu.png", "output.ulaw"]
+
+[lib]
+name = "rustrtc"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow = { version = "1", optional = true }
