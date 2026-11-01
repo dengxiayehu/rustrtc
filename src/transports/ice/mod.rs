@@ -1,8 +1,8 @@
 pub mod conn;
 pub use conn::SourceChange;
-#[cfg(feature = "std")] // mDNS is excluded from the embedded target
+#[cfg(feature = "std")]// mDNS is excluded from the embedded target
 pub mod mdns;
-#[cfg(feature = "std")] // ICE-TCP is excluded from the embedded target
+#[cfg(feature = "std")]// ICE-TCP is excluded from the embedded target
 pub mod shared_tcp;
 
 /// Placeholder registration (ICE-TCP excluded; never constructed).
@@ -14,7 +14,7 @@ pub mod stun;
 #[cfg(all(test, feature = "std"))]
 mod tests;
 pub mod turn;
-#[cfg(feature = "std")] // UPnP is excluded from the embedded target
+#[cfg(feature = "std")]// UPnP is excluded from the embedded target
 pub mod upnp;
 
 // Re-export UPnP types
@@ -292,6 +292,8 @@ pub struct IceTransport {
 }
 
 pub(crate) struct IceTransportInner {
+    turn_read_logged: core::sync::atomic::AtomicBool,
+    turn_error_log: [crate::transports::MediaLogInterval; 3],
     state: watch::Sender<IceTransportState>,
     _state_rx_keeper: watch::Receiver<IceTransportState>,
     gathering_state: watch::Sender<IceGathererState>,
@@ -739,8 +741,11 @@ impl IceTransportRunner {
         let mut buf = [0u8; 1500];
         let mut marshal_buf = Vec::with_capacity(1500);
         let mut state_rx = inner.state.subscribe();
+        let mut read_logged = false;
         let sender = IceSocketWrapper::Udp(socket.clone());
-        trace!("Read loop started for {:?}", socket.local_addr());
+        tracing::info!(event = "media.transport", session_id = inner.config.label.as_deref(),
+            direction = "peer_to_local", stage = "reader_started", transport = "udp", local_addr = ?socket.local_addr().ok(),
+            "media reader started");
         loop {
             let which = {
                 let mut readable_fut = core::pin::pin!(socket.readable());
@@ -750,7 +755,9 @@ impl IceTransportRunner {
             match which {
                 crate::platform::select::Either::A(res) => {
                     if let Err(e) = res {
-                        debug!("Socket readable wait error: {}", e);
+                        tracing::info!(event = "media.transport_drop", session_id = inner.config.label.as_deref(),
+                            direction = "peer_to_local", stage = "udp_reader_stopped", reason = "readable_wait", error = %e,
+                            "media UDP reader stopped");
                         break;
                     }
 
@@ -772,14 +779,23 @@ impl IceTransportRunner {
                                 break;
                             }
                             Err(e) => {
-                                debug!("Socket recv error: {}", e);
+                                tracing::info!(event = "media.transport_drop", session_id = inner.config.label.as_deref(),
+                                    direction = "peer_to_local", stage = "udp_reader_stopped", reason = "recv", error = %e,
+                                    "media UDP reader stopped");
                                 return;
                             }
                         };
 
                         let packet = &buf[..len];
                         if len > 0 {
-                            handle_packet(
+                            if !read_logged {
+                            read_logged = true;
+                            tracing::info!(event = "media.transport", session_id = inner.config.label.as_deref(),
+                                direction = "peer_to_local", stage = "udp_read", from = %addr,
+                                local_addr = ?socket.local_addr().ok(), datagram_bytes = len,
+                                packet_scope = "raw_udp_including_control", "media transport boundary");
+                        }
+                        handle_packet(
                                 packet,
                                 addr,
                                 inner.clone(),
@@ -811,8 +827,17 @@ impl IceTransportRunner {
         inner: Arc<IceTransportInner>,
     ) {
         let mut buf = vec![0u8; 1500];
+        let mut read_logged = false;
         let mut marshal_buf = Vec::with_capacity(1500);
         let sender = IceSocketWrapper::Platform(socket.clone());
+        tracing::info!(
+            event = "media.transport",
+            session_id = inner.config.label.as_deref(),
+            direction = "peer_to_local",
+            stage = "reader_started",
+            transport = "platform",
+            "media reader started"
+        );
         loop {
             let result = crate::platform::time::with_timeout(
                 core::time::Duration::from_secs(1),
@@ -821,11 +846,21 @@ impl IceTransportRunner {
             .await;
             let (len, addr) = match result {
                 Err(_) => continue,
-                Ok(Err(_)) => {
+                Ok(Err(error)) => {
+                    tracing::info!(event = "media.transport_drop", session_id = inner.config.label.as_deref(),
+                        direction = "peer_to_local", stage = "platform_reader_stopped", %error,
+                        "media platform reader stopped");
                     break;
                 }
                 Ok(Ok(v)) => v,
             };
+
+            if !read_logged {
+                read_logged = true;
+                tracing::info!(event = "media.transport", session_id = inner.config.label.as_deref(),
+                                direction = "peer_to_local", stage = "platform_read", from = %addr,
+                                datagram_bytes = len, "media transport boundary");
+            }
             let packet = &buf[..len];
             if len > 0 {
                 handle_packet(
@@ -849,9 +884,17 @@ impl IceTransportRunner {
     ) {
         #[allow(unused_mut)]
         let mut state_rx = inner.state.subscribe();
+        let mut read_logged = false;
         let mut marshal_buf = Vec::with_capacity(1500);
         let sender = IceSocketWrapper::SharedUdp(handle.clone());
-        trace!("Shared UDP read loop started");
+        tracing::info!(
+            event = "media.transport",
+            session_id = inner.config.label.as_deref(),
+            direction = "peer_to_local",
+            stage = "reader_started",
+            transport = "shared_udp",
+            "media reader started"
+        );
         loop {
             // state arm polled first each wake (matches the old `biased;`).
             // The block scopes the pinned futures so `state_rx` is released
@@ -878,6 +921,13 @@ impl IceTransportRunner {
             };
             match packet_opt {
                 Some((packet, addr)) => {
+                        if !read_logged {
+                            read_logged = true;
+                            tracing::info!(event = "media.transport", session_id = inner.config.label.as_deref(),
+                                direction = "peer_to_local", stage = "shared_udp_dispatch", from = %addr,
+                                datagram_bytes = packet.len(), "media transport boundary");
+                        }
+
                     handle_packet(
                         &packet,
                         addr,
@@ -901,7 +951,9 @@ impl IceTransportRunner {
         let mut marshal_buf = Vec::with_capacity(1500);
         #[allow(unused_mut)]
         let mut state_rx = inner.state.subscribe();
-        trace!("Read loop started for TURN client {}", relayed_addr);
+        tracing::info!(event = "media.transport", session_id = inner.config.label.as_deref(),
+            direction = "peer_to_local", stage = "reader_started", transport = "turn", local_addr = %relayed_addr,
+            "media reader started");
         loop {
             let which = {
                 let mut recv_fut = core::pin::pin!(async { client.recv(&mut buf).await });
@@ -911,6 +963,12 @@ impl IceTransportRunner {
             match which {
                 crate::platform::select::Either::A(result) => match result {
                     Ok(len) => {
+                        if !inner.turn_read_logged.load(core::sync::atomic::Ordering::Relaxed)
+                            && !inner.turn_read_logged.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                            tracing::info!(event = "media.transport", session_id = inner.config.label.as_deref(),
+                                direction = "peer_to_local", stage = "turn_wire_read", local_addr = %relayed_addr,
+                                datagram_bytes = len, "media transport boundary");
+                        }
                         if client.is_udp() {
                         }
                         if len > 0 {
@@ -932,6 +990,11 @@ impl IceTransportRunner {
                             continue;
                         }
                         if client.is_udp() {
+                        }
+                        if let Some(suppressed) = inner.turn_error_log[0].observe() {
+                            tracing::warn!(event = "media.transport_drop", session_id = inner.config.label.as_deref(),
+                                direction = "peer_to_local", stage = "turn_reader_failed", error = %e, suppressed,
+                                "media transport boundary");
                         }
                         debug!("TURN client recv error: {}", e);
                         break;
@@ -1005,11 +1068,14 @@ impl IceTransportRunner {
         inner: Arc<IceTransportInner>,
     ) {
         let mut buf = [0u8; 65_535];
+        let mut read_logged = false;
         let mut marshal_buf = Vec::with_capacity(1500);
         let mut state_rx = inner.state.subscribe();
         #[cfg(feature = "std")]
         let sender = IceSocketWrapper::TcpStream(read, write, peer_addr);
-        trace!("TCP read loop started for peer {}", peer_addr);
+        tracing::info!(event = "media.transport", session_id = inner.config.label.as_deref(),
+            direction = "peer_to_local", stage = "reader_started", transport = "tcp", peer_addr = %peer_addr,
+            "media reader started");
         loop {
             let which = {
                 let mut recv_fut = core::pin::pin!(sender.recv_from(&mut buf));
@@ -1019,6 +1085,13 @@ impl IceTransportRunner {
             match which {
                 crate::platform::select::Either::A(result) => match result {
                     Ok((len, addr)) => {
+                        if !read_logged {
+                            read_logged = true;
+                            tracing::info!(event = "media.transport", session_id = inner.config.label.as_deref(),
+                                direction = "peer_to_local", stage = "tcp_frame_read", from = %addr,
+                                datagram_bytes = len, "media transport boundary");
+                        }
+
                         if len > 0 {
                             handle_packet(
                                 &buf[..len],
@@ -1031,7 +1104,9 @@ impl IceTransportRunner {
                         }
                     }
                     Err(e) => {
-                        debug!("TCP recv error from {}: {}", peer_addr, e);
+                        tracing::info!(event = "media.transport_drop", session_id = inner.config.label.as_deref(),
+                            direction = "peer_to_local", stage = "tcp_reader_stopped", peer_addr = %peer_addr, error = %e,
+                            "media TCP reader stopped");
                         break;
                     }
                 },
@@ -1471,6 +1546,8 @@ impl IceTransport {
             },
             turn_refresh_in_progress: core::sync::atomic::AtomicBool::new(false),
             upnp_refresh_in_progress: core::sync::atomic::AtomicBool::new(false),
+            turn_read_logged: core::sync::atomic::AtomicBool::new(false),
+            turn_error_log: core::array::from_fn(|_| Default::default()),
             buffer_stats: Arc::new(BufferStats::default()),
         };
         let inner = Arc::new(inner);
@@ -2287,9 +2364,15 @@ impl IceTransport {
                             marshal_buf,
                         )
                         .await;
-                    } else {
+                    } else if let Some(suppressed) = inner.turn_error_log[1].observe() {
+                        tracing::warn!(event = "media.transport_drop", session_id = inner.config.label.as_deref(),
+                            direction = "peer_to_local", stage = "turn_unknown_channel", suppressed,
+                            "media transport boundary");
                     }
-                } else {
+                } else if let Some(suppressed) = inner.turn_error_log[2].observe() {
+                    tracing::warn!(event = "media.transport_drop", session_id = inner.config.label.as_deref(),
+                        direction = "peer_to_local", stage = "turn_malformed", suppressed,
+                        "media transport boundary");
                 }
                 return;
             }

@@ -99,7 +99,7 @@ pub use transports::udptl::{UdtlConfig, UdtlReceiveBuffer, UdtlTransport};
 #[cfg(feature = "std")]
 use std::future::Future;
 #[cfg(feature = "std")]
-use tracing::Instrument;
+use tracing::{Instrument, instrument::WithSubscriber};
 
 /// Spawn a task on the configured runtime handle when one is set, else on the
 /// ambient (current) runtime. The future is instrumented with `span` so logs
@@ -115,7 +115,11 @@ pub(crate) fn spawn_rtc<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let fut = fut.instrument(span);
+    // A retained PC span owns its dispatcher even when the caller task has
+    // no ambient subscriber (e.g. a sender attached from an ICE worker).
+    let subscriber = tracing::Span::with_subscriber(&span, |(_, dispatch)| dispatch.clone())
+        .unwrap_or_else(|| tracing::dispatcher::get_default(Clone::clone));
+    let fut = fut.instrument(span).with_subscriber(subscriber);
     match handle {
         Some(h) => h.spawn(fut),
         None => tokio::spawn(fut),

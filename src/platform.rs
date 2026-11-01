@@ -574,7 +574,11 @@ pub mod task {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        tokio::spawn(fut)
+        use tracing::{Instrument, instrument::WithSubscriber};
+        tokio::spawn(
+            fut.instrument(tracing::Span::current())
+                .with_current_subscriber(),
+        )
     }
 
     /// Sleeps for `dur`.

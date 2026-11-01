@@ -1014,8 +1014,8 @@ impl PeerConnection {
         // `{session_id}-{leg}`) is recorded on the span so every log emitted
         // inside the instrumented runner tasks carries it.
         let pc_span = match config.label.clone() {
-            Some(l) => debug_span!("pc", label = %l),
-            None => debug_span!("pc"),
+            Some(l) => tracing::info_span!("pc", session_id = %l),
+            None => tracing::info_span!("pc"),
         };
 
         let inner = PeerConnectionInner {
@@ -5161,8 +5161,7 @@ async fn monitor_ice_and_dtls(
     inner_weak: Weak<PeerConnectionInner>,
     ice_connection_state_tx: &watch::Sender<IceConnectionState>,
     ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
-    #[allow(unused_mut)]
-    mut dtls_rx: watch::Receiver<dtls::DtlsState>,
+    #[allow(unused_mut)] mut dtls_rx: watch::Receiver<dtls::DtlsState>,
     mut rtcp_loop: core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>,
 ) -> bool {
     let Some(grace) = inner_weak.upgrade().map(|i| i.config.ice_disconnect_grace) else {
@@ -5236,6 +5235,9 @@ async fn monitor_ice_and_dtls(
             }
             crate::platform::select::Which4::C(res) => {
                 if res.is_ok() {
+                    tracing::info!(event = "media.transport_state", session_id = inner.config.label.as_deref(),
+                        direction = "bidirectional", stage = "dtls_state", state = %*dtls_rx.borrow(),
+                        "media transport state changed");
                     let state = dtls_rx.borrow().clone();
                     if state == dtls::DtlsState::Closed || state == dtls::DtlsState::Failed {
                         debug!("DTLS closed/failed, disconnecting PC");
@@ -16083,4 +16085,3 @@ a=mid:0
             TRANSPORT_LOOP_LIVE[3].load(Ordering::Relaxed),
         ]
     }
-

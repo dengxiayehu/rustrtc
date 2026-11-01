@@ -428,25 +428,23 @@ Streams a video file (`examples/static/output.ivf`) via RTP to a UDP port, which
 
 This project is licensed under the MIT License.
 
-### Optional packet-stage diagnostics
+### Transport diagnostics in fork-rustrtc 0.4.22
 
-Enable the `diagnostics` Cargo feature to record packet-stage counts, bytes and
-monotonic first/last observation ages. `PeerConnection::packet_diagnostics()`
-returns typed ICE, TURN, DTLS-state, RTP/SRTP, listener and send observations.
-`IceTransport::diagnostic_snapshot()` and `RtpTransport::diagnostic_snapshot()`
-provide JSON views of the same counters for existing consumers.
+The upstream stats and RTP observer APIs are unchanged. Core INFO logs follow
+media through reader startup, the first raw datagram, the first RTP packet
+accepted after parse/decrypt, and the destination's first successful RTP socket
+write. Control traffic cannot consume the first RTP-write observation. A local
+socket write does not establish peer receipt, decoding or physical playback.
 
-Detailed recording is off by default: stage counters have no clock or atomic
-updates, TURN history is empty, and deferred-send observation is inactive.
-Snapshots report `enabled: false`; existing transport totals remain available.
-When enabled, recording adds clock reads and relaxed atomic updates at packet
-boundaries. Snapshots are cumulative observations, not atomic transactions across
-stages. They do not include payloads, keys, ICE credentials or TURN auth data.
-TURN history retains at most eight request attempts.
+Successful milestones are logged once per reader/transport, without periodic
+output. Repeated failures are limited to one event per five seconds per owner
+and error boundary, with a suppressed-event count. Distinct failure categories
+cannot hide each other's first occurrence. Buffering before SRTP readiness is
+identified as buffering rather than packet loss. Reader termination errors
+retain their cause.
 
-Diagnostics never emit logs or run a polling task. Consumers choose when to read
-and must rate-limit their own output. The optional deferred-send observer is
-invoked only after `mark_stopping()` and must remain nonblocking, rate-limit any
-output and avoid retaining its owning connection or transport. It observes
-completion without delaying, draining or cancelling sends. Recording is independent
-of codec, application, call-center policy and deployment environment.
+The connection's retained tracing parent supplies the real call and destination
+leg identity, including relay and deferred sends invoked by another leg. No
+payloads, keys or credentials are logged. No new switch, callback, polling task,
+packet history or public diagnostics/stats API is added. Applications use the
+existing stats for quantities; unavailable counters remain unmeasured.
