@@ -1,3 +1,23 @@
+# fork-rustrtc preview
+
+This is a temporary preview distribution of [restsend/rustrtc](https://github.com/restsend/rustrtc),
+based on upstream commit `4e42600e0526642145342790181a03ebc9cc888e`, including merged PR #80.
+The package is published separately as `fork-rustrtc` version `0.4.20-preview`;
+it is not an official `rustrtc` release. The upstream MIT license and attribution are preserved.
+
+Use a Cargo dependency alias to retain the `rustrtc` import name:
+
+```toml
+rustrtc = { package = "fork-rustrtc", version = "=0.4.20-preview", features = ["diagnostics"] }
+```
+
+The existing `diagnostics` feature enables detailed packet-stage observations.
+This preview does not change upstream runtime behavior or feature defaults.
+Consumers can return to the official package after an upstream release contains
+the required changes. All consumers that exchange rustrtc types must use the same package.
+
+---
+
 # rustrtc
 
 [![Crates.io](https://img.shields.io/crates/v/rustrtc.svg)](https://crates.io/crates/rustrtc)
