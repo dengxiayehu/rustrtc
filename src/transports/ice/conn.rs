@@ -147,6 +147,10 @@ fn can_reach(socket: Option<&IceSocketWrapper>, addr: SocketAddr) -> bool {
 }
 
 pub struct IceConn {
+    pub(crate) media_error_log_interval: core::time::Duration,
+    send_logged: AtomicBool,
+    error_log: [crate::transports::MediaLogInterval; 3],
+    pub(crate) log_span: tracing::Span,
     pub socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
     rtcp_socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
     pub remote_addr: RwLock<SocketAddr>,
@@ -220,7 +224,15 @@ impl IceConn {
         remote_addr: SocketAddr,
         label: Option<String>,
     ) -> Arc<Self> {
-        Self::new_with_rtcp(socket_rx.clone(), socket_rx, remote_addr, label, None)
+        Self::new_with_rtcp(
+            socket_rx.clone(),
+            socket_rx,
+            remote_addr,
+            label,
+            None,
+            crate::config::default_media_error_log_interval(),
+            tracing::Span::current(),
+        )
     }
 
     pub(crate) fn new_with_rtcp(
@@ -229,8 +241,16 @@ impl IceConn {
         remote_addr: SocketAddr,
         label: Option<String>,
         probation_max_packets: Option<u8>,
+        media_error_log_interval: core::time::Duration,
+        log_span: tracing::Span,
     ) -> Arc<Self> {
         Arc::new(Self {
+            media_error_log_interval,
+            send_logged: AtomicBool::new(false),
+            error_log: core::array::from_fn(|_| {
+                crate::transports::MediaLogInterval::new(media_error_log_interval)
+            }),
+            log_span,
             socket_rx,
             rtcp_socket_rx,
             remote_addr: RwLock::new(remote_addr),
@@ -265,6 +285,47 @@ impl IceConn {
             clock_offset_ms: AtomicU64::new(0),
             deferred_send_tx: OnceLock::new(),
         })
+    }
+
+    /// A relay invokes the destination from the source task. Only enter the
+    /// owner's context when emitting a log, never on every forwarded packet.
+    pub(crate) fn with_log_context<T>(&self, f: impl FnOnce() -> T) -> T {
+        #[cfg(feature = "std")]
+        if let Some(dispatch) = tracing::Span::with_subscriber(&self.log_span, |(_, d)| d.clone()) {
+            return tracing::dispatcher::with_default(&dispatch, f);
+        }
+        f()
+    }
+
+    fn is_rtp(buf: &[u8]) -> bool {
+        buf.len() >= 2 && (128..192).contains(&buf[0]) && !(200..=211).contains(&buf[1])
+    }
+
+    fn log_send(
+        &self,
+        failed: bool,
+        buf: &[u8],
+        reason: &'static str,
+        error: Option<&dyn core::fmt::Display>,
+    ) {
+        let suppressed = if failed {
+            self.error_log[0].observe()
+        } else if Self::is_rtp(buf)
+            && !self.send_logged.load(Ordering::Relaxed)
+            && !self.send_logged.swap(true, Ordering::Relaxed)
+        {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(suppressed) = suppressed {
+            self.with_log_context(|| tracing::info!(parent: &self.log_span,
+                event = "media.transport", session_id = self.label.as_deref(),
+                direction = "local_to_peer", stage = if failed { "socket_send_failed" } else { "socket_send_completed" },
+                local_addr = %self.local_addr(), peer_addr = %*self.remote_addr.read(),
+                datagram_bytes = buf.len(), rtp = Self::is_rtp(buf), reason, error = error.map(tracing::field::display), suppressed,
+                completion_scope = "local_socket_write_not_peer_receipt", "media transport boundary"));
+        }
     }
 
     pub fn set_probation_max_packets(&self, max: Option<u8>) {
@@ -729,6 +790,7 @@ impl IceConn {
             let mut socket_rx = self.socket_rx.clone();
             let socket = socket_rx.borrow_and_update().clone();
             let Some(socket) = socket else {
+                self.log_send(true, buf, "no_selected_socket", None);
                 tracing::trace!("IceConn: try_send failed - no selected socket");
                 return Err(RtcError::Internal(format!("No selected socket")));
             };
@@ -740,11 +802,14 @@ impl IceConn {
     fn do_try_send(&self, socket: IceSocketWrapper, buf: &[u8]) -> RtcResult<usize> {
         let remote = *self.remote_addr.read();
         if remote.port() == 0 {
+            self.log_send(true, buf, "remote_address_unset", None);
             return Err(RtcError::Internal(format!("Remote address not set")));
         }
         match &socket {
             IceSocketWrapper::Udp(_) | IceSocketWrapper::SharedUdp(_) => {
-                let n = socket.try_send_to(buf, remote)?;
+                let n = socket.try_send_to(buf, remote)
+                    .inspect_err(|e| self.log_send(true, buf, "socket_write", Some(e)))?;
+                self.log_send(false, buf, "written", None);
                 // Keep legacy transport totals intact.
                 Ok(n)
             }
@@ -764,21 +829,41 @@ impl IceConn {
     fn defer_async_send(&self, socket: IceSocketWrapper, buf: &[u8], addr: SocketAddr) {
         let tx = self.deferred_send_tx.get_or_init(|| {
             let (tx, mut rx) = mpsc::unbounded_channel::<(IceSocketWrapper, Vec<u8>, SocketAddr)>();
-            task::spawn(async move {
+            let label = self.label.clone();
+            let log_interval = self.media_error_log_interval;
+            let span = self.log_span.clone();
+            #[cfg(feature = "std")]
+            let dispatch = tracing::Span::with_subscriber(&span, |(_, d)| d.clone())
+                .unwrap_or_else(|| tracing::dispatcher::get_default(Clone::clone));
+            use tracing::Instrument;
+            #[cfg(feature = "std")]
+            use tracing::instrument::WithSubscriber;
+            let task_span = span.clone();
+            let drain = async move {
+                let mut completed_logged = false;
+                let failed_log = crate::transports::MediaLogInterval::new(log_interval);
                 while let Some((socket, buf, addr)) = rx.recv().await {
                     let result = socket.send_to(&buf, addr).await;
-                    if let Err(e) = result {
-                        debug!(
-                            error = %e,
-                            "IceConn: deferred async send failed (relay fast-path fallback)"
-                        );
+                    let emit = if result.is_err() { failed_log.observe() }
+                        else if Self::is_rtp(&buf) && !completed_logged { completed_logged = true; Some(0) }
+                        else { None };
+                    if let Some(suppressed) = emit {
+                        let error = result.as_ref().err().map(|e| e.to_string());
+                        tracing::info!(parent: &span, event = "media.transport", session_id = label.as_deref(),
+                            direction = "local_to_peer", peer_addr = %addr,
+                            stage = if result.is_err() { "socket_send_failed" } else { "socket_send_completed" },
+                            deferred = true, datagram_bytes = buf.len(), error, suppressed,
+                            completion_scope = "local_socket_write_not_peer_receipt", "media transport boundary");
                     }
                 }
-            });
+            }.instrument(task_span);
+            #[cfg(feature = "std")]
+            let drain = drain.with_subscriber(dispatch);
+            task::spawn(drain);
             tx
         });
         if tx.send((socket, buf.to_vec(), addr)).is_err() {
-            trace!("IceConn: deferred send queue closed, dropping packet");
+            self.log_send(true, buf, "deferred_queue_closed", None);
         }
     }
 
@@ -794,7 +879,9 @@ impl IceConn {
             if remote.port() == 0 {
                 return Err(RtcError::Internal(format!("Remote address not set")));
             }
-            let n = socket.send_to(buf, remote).await?;
+            let n = socket.send_to(buf, remote).await
+                .inspect_err(|e| self.log_send(true, buf, "socket_write", Some(e)))?;
+            self.log_send(false, buf, "written", None);
             self.tx_packets.fetch_add(1, Ordering::Relaxed);
             self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
             Ok(n)
@@ -808,11 +895,14 @@ impl IceConn {
                 if remote.port() == 0 {
                     return Err(RtcError::Internal(format!("Remote address not set")));
                 }
-                let n = socket.send_to(buf, remote).await?;
+                let n = socket.send_to(buf, remote).await
+                .inspect_err(|e| self.log_send(true, buf, "socket_write", Some(e)))?;
+            self.log_send(false, buf, "written", None);
                 self.tx_packets.fetch_add(1, Ordering::Relaxed);
                 self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 Ok(n)
             } else {
+                self.log_send(true, buf, "no_selected_socket", None);
                 tracing::trace!("IceConn: send failed - no selected socket");
                 Err(RtcError::Internal(format!("No selected socket")))
             }
@@ -915,7 +1005,9 @@ impl IceConn {
         }
 
         if let Some(socket) = socket_opt {
-            let n = socket.send_to(buf, remote).await?;
+            let n = socket.send_to(buf, remote).await
+                .inspect_err(|e| self.log_send(true, buf, "socket_write", Some(e)))?;
+            self.log_send(false, buf, "written", None);
             self.tx_packets.fetch_add(1, Ordering::Relaxed);
             self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
             Ok(n)
@@ -989,6 +1081,11 @@ impl PacketReceiver for IceConn {
                 strong_rx.receive(packet, addr, marshal_buf).await;
             } else {
                 let drops = self.dtls_no_receiver_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(suppressed) = self.error_log[1].observe() {
+                    self.with_log_context(|| tracing::info!(parent: &self.log_span, event = "media.transport_drop", session_id = self.label.as_deref(),
+                        direction = "peer_to_local", stage = "dtls_receiver_missing", from = %addr,
+                        datagram_bytes = packet.len(), drops, suppressed, "media transport drop"));
+                }
                 debug!(
                     drops,
                     len = packet.len(),
@@ -1102,10 +1199,11 @@ impl PacketReceiver for IceConn {
                 self.maybe_log_both_ways(label_str);
                 strong_rx.receive(packet, addr, marshal_buf).await;
             } else {
-                trace!(
-                    "IceConn: No RTP receiver registered for packet from {}",
-                    addr
-                );
+                if let Some(suppressed) = self.error_log[2].observe() {
+                    self.with_log_context(|| tracing::warn!(parent: &self.log_span, event = "media.transport_drop", session_id = self.label.as_deref(),
+                        direction = "peer_to_local", stage = "rtp_receiver_missing", from = %addr,
+                        datagram_bytes = packet.len(), suppressed, "media transport drop"));
+                }
             }
         } else {
         }
@@ -1269,7 +1367,15 @@ mod tests {
         let rtcp_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rtcp_addr = rtcp_receiver.local_addr().unwrap();
 
-        let conn = IceConn::new_with_rtcp(rx, rtcp_rx, rtp_addr, None, None);
+        let conn = IceConn::new_with_rtcp(
+            rx,
+            rtcp_rx,
+            rtp_addr,
+            None,
+            None,
+            crate::config::default_media_error_log_interval(),
+            tracing::Span::current(),
+        );
         conn.set_remote_rtcp_addr(Some(rtcp_addr));
 
         // Send RTP (via send) -> should go to rtp_addr
@@ -2268,5 +2374,387 @@ mod tests {
             let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
             assert_eq!(&buf[..len], expected.as_slice());
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod boundary_log_tests {
+    use super::*;
+    use std::io::Write;
+    use tracing::Instrument;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn real_udp_send_logs_completion_once_with_complete_call_identity() {
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || Sink(sink.clone()))
+            .finish();
+        async {
+            let span = tracing::info_span!(
+                "media",
+                call_id = "transport-log-session",
+                leg_id = "caller-leg"
+            );
+            async {
+                let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                socket.writable().await.unwrap();
+                let (_tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(socket)));
+                let conn = IceConn::new(
+                    rx,
+                    peer.local_addr().unwrap(),
+                    Some("transport-log-session".into()),
+                );
+                conn.try_send(b"\x16\x00control").unwrap();
+                let mut control = [0u8; 32];
+                peer.recv_from(&mut control).await.unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        tracing::info_span!("source", leg_id = "wrong-source-leg")
+                            .in_scope(|| conn.try_send(b"\x80\x00media"))
+                            .unwrap(),
+                        7
+                    );
+                    let mut wire = [0u8; 32];
+                    let (n, _) = peer.recv_from(&mut wire).await.unwrap();
+                    assert_eq!(&wire[..n], b"\x80\x00media");
+                }
+                tokio::time::sleep(core::time::Duration::from_millis(5_010)).await;
+                assert_eq!(
+                    tracing::info_span!("source", leg_id = "wrong-source-leg")
+                        .in_scope(|| conn.try_send(b"\x80\x00media"))
+                        .unwrap(),
+                    7
+                );
+                let mut wire = [0u8; 32];
+                assert_eq!(peer.recv_from(&mut wire).await.unwrap().0, 7);
+                let (_tx, rx) = watch::channel(None);
+                let missing = IceConn::new(
+                    rx,
+                    peer.local_addr().unwrap(),
+                    Some("transport-log-session".into()),
+                );
+                assert!(missing.try_send(b"\x80\x00media").is_err());
+                assert!(missing.try_send(b"\x80\x00media").is_err());
+            }
+            .instrument(span)
+            .await;
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let rows = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let completed: Vec<_> = rows
+            .lines()
+            .filter(|row| row.contains("stage=\"socket_send_completed\""))
+            .collect();
+        let failed: Vec<_> = rows
+            .lines()
+            .filter(|row| row.contains("stage=\"socket_send_failed\""))
+            .collect();
+        assert_eq!(
+            completed.len(),
+            1,
+            "successful packet bursts must not create periodic logs: {rows}"
+        );
+        assert_eq!(failed.len(), 1, "{rows}");
+        for row in completed.into_iter().chain(failed) {
+            assert!(
+                row.contains("transport-log-session") && row.contains("caller-leg"),
+                "{row}"
+            );
+            assert!(!row.contains("wrong-source-leg"), "{row}");
+            assert!(row.contains("direction=\"local_to_peer\""), "{row}");
+            assert!(
+                !row.contains("media_payload"),
+                "payloads are not diagnostic metadata"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn peer_connection_errors_keep_owner_and_use_configured_interval() {
+        use crate::{PeerConnection, RtcConfiguration, SdpType, SessionDescription};
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || Sink(sink.clone()))
+            .finish();
+        let _interest_registry = tracing::Dispatch::new(tracing_subscriber::registry());
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let mut peers = Vec::new();
+            for (id, interval) in [("default-owner@pbx", None), ("configured-owner@pbx", Some(2))] {
+                let mut config = serde_json::to_value(RtcConfiguration::sip()).unwrap();
+                config.as_object_mut().unwrap().remove("media_error_log_interval");
+                if let Some(secs) = interval {
+                    // Exercise configuration input and real transport output;
+                    // an ignored field must fail the cadence assertion.
+                    config["media_error_log_interval"] = serde_json::json!({"secs":secs,"nanos":0});
+                }
+                let config = serde_json::from_value(config).unwrap();
+                let owner = tracing::info_span!("media_leg", call_id = tracing::field::Empty, leg_id = id);
+                let pc = owner.in_scope(|| PeerConnection::new(config));
+                // Deliberately apply SDP outside the owner's scope: media
+                // transport creation must retain the connection's identity.
+                let offer = SessionDescription::parse(SdpType::Offer,
+                    "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 9 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\nm=video 11 RTP/AVP 96\r\na=rtpmap:96 VP8/90000\r\n").unwrap();
+                pc.set_remote_description(offer).await.unwrap();
+                let (_source, track, _) = crate::media::track::sample_track(crate::media::MediaKind::Video, 8);
+                let video = pc.add_track(track, crate::RtpCodecParameters {
+                    payload_type: 96, name: "VP8".into(), clock_rate: 90000, channels: 1,
+                }).unwrap();
+                let answer = pc.create_answer().await.unwrap();
+                pc.set_local_description(answer).unwrap();
+                // Like SIP binding, identity arrives after connection setup.
+                owner.record("call_id", id);
+                let transport = tokio::time::timeout(core::time::Duration::from_secs(2), async {
+                    loop {
+                        if let Some(transport) = pc.rtp_transport_for_test() { break transport; }
+                        tokio::time::sleep(core::time::Duration::from_millis(5)).await;
+                    }
+                }).await.expect("real SDP must attach RTP");
+                peers.push((pc, vec![transport, video.transport().expect("video uses its own direct transport")]));
+            }
+            let foreign = tracing::info_span!("unrelated", call_id = "other-call@pbx", leg_id = "wrong-leg");
+            for transport in peers.iter().flat_map(|(_, transports)| transports) {
+                for _ in 0..2 {
+                    transport.feed_packet(Bytes::from_static(&[0x80, 0]), "127.0.0.1:9".parse().unwrap())
+                        .instrument(foreign.clone()).await;
+                }
+            }
+            tokio::time::sleep(core::time::Duration::from_millis(2_100)).await;
+            for transport in peers.iter().flat_map(|(_, transports)| transports) {
+                for _ in 0..2 {
+                    transport.feed_packet(Bytes::from_static(&[0x80, 0]), "127.0.0.1:9".parse().unwrap())
+                        .instrument(foreign.clone()).await;
+                }
+            }
+            // Authentication failures and absent sinks take distinct log
+            // paths; all must retain the same owner under foreign dispatch.
+            use crate::srtp::{SrtpKeyingMaterial, SrtpProfile, SrtpSession};
+            for transport in peers.iter().flat_map(|(_, transports)| transports) {
+                let key = || SrtpKeyingMaterial::new(vec![7; 16], vec![9; 14]);
+                transport.start_srtp(SrtpSession::new(SrtpProfile::Aes128Sha1_80, key(), key()).unwrap());
+                let packet = crate::rtp::RtpPacket::new(
+                    crate::rtp::RtpHeader::new(0, 1, 160, 42), vec![0; 32],
+                ).marshal().unwrap();
+                transport.feed_packet(Bytes::from(packet.clone()), "127.0.0.1:9".parse().unwrap())
+                    .instrument(foreign.clone()).await;
+                let conn = transport.ice_conn();
+                conn.receive(Bytes::from_static(&[22, 0]), "127.0.0.1:9".parse().unwrap(), &mut Vec::new())
+                    .instrument(foreign.clone()).await;
+                let transient = Arc::new(crate::transports::rtp::RtpTransport::new(conn.clone(), false));
+                conn.set_rtp_receiver(transient.clone());
+                drop(transient);
+                conn.receive(Bytes::from(packet), "127.0.0.1:9".parse().unwrap(), &mut Vec::new())
+                    .instrument(foreign.clone()).await;
+            }
+            let rows = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            let errors: Vec<_> = rows.lines().filter(|r| r.contains("stage=\"rtp_parse_failed\"")).collect();
+            for row in &errors {
+                assert!(row.contains("call_id=") && row.contains("leg_id=") && row.contains("owner@pbx"),
+                    "transport error lost its searchable owner: {row}");
+                assert!(!row.contains("other-call@pbx") && !row.contains("wrong-leg"), "{row}");
+            }
+            assert_eq!(errors.iter().filter(|r| r.contains("default-owner@pbx")).count(), 2, "{rows}");
+            assert_eq!(errors.iter().filter(|r| r.contains("configured-owner@pbx")).count(), 4, "{rows}");
+            assert!(errors.iter().any(|r| r.contains("suppressed=1")), "{rows}");
+            for stage in ["srtp_unprotect_failed", "dtls_receiver_missing", "rtp_receiver_missing"] {
+                let matching: Vec<_> = rows.lines().filter(|r| r.contains(stage) && r.contains("media.transport_drop")).collect();
+                assert!(!matching.is_empty(), "missing real failure stage {stage}: {rows}");
+                for row in matching {
+                    assert!(row.contains("call_id=") && row.contains("leg_id=") && row.contains("owner@pbx")
+                        && !row.contains("other-call@pbx") && !row.contains("wrong-leg"),
+                        "failure inherited another call's context: {row}");
+                }
+            }
+            for (pc, _) in peers { pc.close(); }
+        }.with_subscriber(subscriber).await;
+    }
+
+    #[tokio::test]
+    async fn relay_logs_target_leg_and_preserves_distinct_failure_evidence() {
+        use crate::rtp::{RtpHeader, RtpPacket};
+        use crate::transports::rtp::{RtpRewriteBridgeParams, RtpTransport};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || Sink(sink.clone()))
+            .finish();
+        async {
+            tracing::callsite::rebuild_interest_cache();
+            let source_span =
+                tracing::info_span!("media", call_id = "relay-call", leg_id = "source-leg");
+            let (_tx, rx) = watch::channel(None);
+            let source = source_span.in_scope(|| {
+                RtpTransport::new(
+                    IceConn::new(
+                        rx,
+                        "127.0.0.1:9".parse().unwrap(),
+                        Some("relay-call".into()),
+                    ),
+                    false,
+                )
+            });
+            let packet = RtpPacket::new(RtpHeader::new(0, 1, 160, 42), vec![1; 160])
+                .marshal()
+                .unwrap();
+            for deferred in [false, true] {
+                let target_leg = if deferred { "target-tcp" } else { "target-udp" };
+                let span =
+                    tracing::info_span!("media", call_id = "relay-call", leg_id = target_leg);
+                let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                socket.writable().await.unwrap();
+                let (tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(socket)));
+                let conn = span.in_scope(|| {
+                    IceConn::new(rx, peer.local_addr().unwrap(), Some("relay-call".into()))
+                });
+                let target = Arc::new(RtpTransport::new(conn.clone(), false));
+                // Upstream 0.6 bridges keep Weak destinations; the live leg owns
+                // its transport. Keep that owner alive through the wire assertion.
+                source.bridge_rewrite_to(target.clone(), RtpRewriteBridgeParams::default());
+                if deferred {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let (mut remote, _) = listener.accept().await.unwrap();
+                    let (read, write) = stream.into_split();
+                    let write = Arc::new(tokio::sync::Mutex::new(write));
+                    tx.send_replace(Some(IceSocketWrapper::TcpStream(
+                        Arc::new(tokio::sync::Mutex::new(read)),
+                        write.clone(),
+                        listener.local_addr().unwrap(),
+                    )));
+                    source
+                        .feed_packet(Bytes::from(packet.clone()), "127.0.0.1:9".parse().unwrap())
+                        .instrument(source_span.clone())
+                        .await;
+                    let mut wire = vec![0; packet.len() + 2];
+                    tokio::time::timeout(
+                        core::time::Duration::from_secs(1),
+                        remote.read_exact(&mut wire),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    write.lock().await.shutdown().await.unwrap();
+                    // The same drain task must retain target identity and expose the actual I/O error.
+                    source
+                        .feed_packet(Bytes::from(packet.clone()), "127.0.0.1:9".parse().unwrap())
+                        .instrument(source_span.clone())
+                        .await;
+                    tokio::time::sleep(core::time::Duration::from_millis(30)).await;
+                } else {
+                    source
+                        .feed_packet(Bytes::from(packet.clone()), "127.0.0.1:9".parse().unwrap())
+                        .instrument(source_span.clone())
+                        .await;
+                    let mut wire = [0; 512];
+                    tokio::time::timeout(
+                        core::time::Duration::from_secs(1),
+                        peer.recv_from(&mut wire),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                }
+            }
+            source.clear_bridge_rewrite();
+            for _ in 0..2 {
+                source
+                    .feed_packet(
+                        Bytes::from_static(&[0x80, 0]),
+                        "127.0.0.1:9".parse().unwrap(),
+                    )
+                    .instrument(source_span.clone())
+                    .await;
+                source
+                    .feed_packet(Bytes::from(packet.clone()), "127.0.0.1:9".parse().unwrap())
+                    .instrument(source_span.clone())
+                    .await;
+            }
+            // Two failures in the same instant must both be visible, once per category.
+            for _ in 0..2 {
+                source
+                    .feed_packet(
+                        Bytes::from_static(&[0x80, 0]),
+                        "127.0.0.1:9".parse().unwrap(),
+                    )
+                    .instrument(source_span.clone())
+                    .await;
+                let (_tx, rx) = watch::channel(None);
+                let conn = source_span.in_scope(|| {
+                    IceConn::new(
+                        rx,
+                        "127.0.0.1:9".parse().unwrap(),
+                        Some("relay-call".into()),
+                    )
+                });
+                let target = Arc::new(RtpTransport::new(conn, true));
+                // Upstream 0.6 bridges keep Weak destinations; the live leg owns
+                // its transport. Keep that owner alive through the wire assertion.
+                source.bridge_rewrite_to(target.clone(), RtpRewriteBridgeParams::default());
+                source
+                    .feed_packet(Bytes::from(packet.clone()), "127.0.0.1:9".parse().unwrap())
+                    .instrument(source_span.clone())
+                    .await;
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let rows = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let sends: Vec<_> = rows
+            .lines()
+            .filter(|r| r.contains("socket_send_"))
+            .collect();
+        assert_eq!(sends.len(), 3, "{rows}");
+        for row in sends {
+            assert!(
+                row.contains("relay-call") && row.contains("target-"),
+                "{row}"
+            );
+            assert!(
+                !row.contains("source-leg"),
+                "target send inherited source identity: {row}"
+            );
+            if row.contains("socket_send_failed") {
+                assert!(row.contains("error="), "{row}");
+            }
+        }
+        for stage in ["rtp_parse_failed", "rtp_listener_missing"] {
+            assert_eq!(
+                rows.lines()
+                    .filter(|row| row.contains(&format!("stage=\"{stage}\"")))
+                    .count(),
+                1,
+                "distinct failures must each remain visible and rate limited: {rows}"
+            );
+        }
+        assert!(rows.contains("relay_srtp_session_missing"), "{rows}");
     }
 }

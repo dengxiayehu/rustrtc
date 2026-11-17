@@ -1,3 +1,16 @@
+> This is `fork-rustrtc 0.6.4`, based on upstream rustrtc v0.6.4
+> (`076dbe7ad2fc01af6518efe0037256127d9f5530`). Package source:
+> https://github.com/dengxiayehu/rustrtc/tree/release/fork-rustrtc-0.6.4
+>
+> Retained patches: established local re-offer rollback; correlated, rate-limited
+> transport diagnostics; atomic RTP sequence allocation for audio/DTMF; control
+> packets sharing sequence order without changing the audio jitter-buffer clock.
+> `RtcConfiguration::media_error_log_interval` defaults to five seconds and may
+> be supplied by the application. First errors remain immediate; first-success
+> logs remain one-shot. Media transports retain their owning connection span,
+> including independent video transports. Business session/SIP Call-ID mapping
+> remains the application's responsibility. No new runtime feature is required.
+
 # rustrtc
 
 [![Crates.io](https://img.shields.io/crates/v/rustrtc.svg)](https://crates.io/crates/rustrtc)
