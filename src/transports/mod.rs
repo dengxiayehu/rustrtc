@@ -264,3 +264,40 @@ fn interface_priority(name: &str, ip: &std::net::Ipv4Addr) -> i32 {
 
     score
 }
+
+/// Only logging cadence lives here: no packet history, public stats or task.
+/// Success and error call sites use separate windows so traffic cannot hide
+/// the first failure. The returned count describes suppressed log events.
+pub(crate) struct MediaLogInterval {
+    interval_ms: u64,
+    epoch: crate::platform::time::Instant,
+    last_ms: crate::platform::atomic64::AtomicU64,
+    suppressed: crate::platform::atomic64::AtomicU64,
+}
+impl MediaLogInterval {
+    pub(crate) fn new(interval: core::time::Duration) -> Self {
+        Self {
+            interval_ms: interval.as_millis().min(u64::MAX as u128) as u64,
+            epoch: crate::platform::time::Instant::now(),
+            last_ms: crate::platform::atomic64::AtomicU64::new(0),
+            suppressed: crate::platform::atomic64::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn observe(&self) -> Option<u64> {
+        use core::sync::atomic::Ordering;
+        let now = self.epoch.elapsed().as_millis() as u64 + 1;
+        let previous = self.last_ms.load(Ordering::Relaxed);
+        if (previous == 0 || now.saturating_sub(previous) >= self.interval_ms)
+            && self
+                .last_ms
+                .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            Some(self.suppressed.swap(0, Ordering::Relaxed))
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}

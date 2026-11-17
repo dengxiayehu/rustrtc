@@ -566,6 +566,10 @@ fn default_rtp_buffer_capacity() -> usize {
     100
 }
 
+pub(crate) fn default_media_error_log_interval() -> core::time::Duration {
+    core::time::Duration::from_secs(5)
+}
+
 fn default_buffer_stats_log_interval() -> core::time::Duration {
     core::time::Duration::from_secs(10)
 }
@@ -851,6 +855,11 @@ pub struct RtcConfiguration {
     /// How often to log receive-buffer occupancy stats. Default 10 s.
     #[serde(default = "default_buffer_stats_log_interval")]
     pub buffer_stats_log_interval: core::time::Duration,
+    /// Minimum interval between repeated media-boundary errors, per
+    /// transport and error category. The first error is always logged.
+    /// Defaults to 5 s; zero disables throttling. Success logs are unaffected.
+    #[serde(default = "default_media_error_log_interval")]
+    pub media_error_log_interval: core::time::Duration,
     /// Controls ICE TCP candidate support (RFC 6544).
     /// Default: Disabled — only UDP candidates are gathered and used.
     #[serde(default)]
@@ -949,6 +958,7 @@ impl PartialEq for RtcConfiguration {
             && self.rtp_buffer_capacity == other.rtp_buffer_capacity
             && self.buffer_drop_strategy == other.buffer_drop_strategy
             && self.buffer_stats_log_interval == other.buffer_stats_log_interval
+            && self.media_error_log_interval == other.media_error_log_interval
             && self.ice_tcp_policy == other.ice_tcp_policy
             && self.ice_udp_mux == other.ice_udp_mux
             && self.ice_udp_mux_port == other.ice_udp_mux_port
@@ -1051,6 +1061,7 @@ impl RtcConfiguration {
             rtp_buffer_capacity: default_rtp_buffer_capacity(),
             buffer_drop_strategy: BufferDropStrategy::default(),
             buffer_stats_log_interval: default_buffer_stats_log_interval(),
+            media_error_log_interval: default_media_error_log_interval(),
             ice_tcp_policy: IceTcpPolicy::default(),
             ice_udp_mux: false,
             ice_udp_mux_port: None,

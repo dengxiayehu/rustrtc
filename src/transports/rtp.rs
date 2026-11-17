@@ -532,6 +532,8 @@ impl ListenerRegistry {
 }
 
 pub struct RtpTransport {
+    error_log: [crate::transports::MediaLogInterval; 13],
+    pending_log: crate::transports::MediaLogInterval,
     transport: Arc<IceConn>,
     srtp_session: Mutex<Option<Arc<Mutex<SrtpSession>>>>,
     listeners: Mutex<ListenerRegistry>,
@@ -599,6 +601,12 @@ impl RtpTransport {
         _allow_ssrc_change: bool,
     ) -> Self {
         Self {
+            error_log: core::array::from_fn(|_| {
+                crate::transports::MediaLogInterval::new(transport.media_error_log_interval)
+            }),
+            pending_log: crate::transports::MediaLogInterval::new(
+                transport.media_error_log_interval,
+            ),
             transport,
             srtp_session: Mutex::new(None),
             listeners: Mutex::new(ListenerRegistry::default()),
@@ -658,7 +666,40 @@ impl RtpTransport {
         self.receive(packet, addr, &mut buf).await;
     }
 
-    /// Cumulative accepted inbound RTP packets, before relay or depacketization.
+    fn error_window(&self, stage: &'static str) -> &crate::transports::MediaLogInterval {
+        let index = match stage {
+            "rtp_parse_failed" => 0,
+            "srtp_parse_failed" => 1,
+            "srtp_unprotect_failed" => 2,
+            "srtcp_unprotect_failed" => 3,
+            "rtcp_parse_failed" => 4,
+            "rtp_listener_full" => 5,
+            "rtp_listener_closed" => 6,
+            "rtp_listener_missing" => 7,
+            "rtcp_listener_closed" => 8,
+            "srtp_protect_failed" => 9,
+            "srtp_send_session_missing" => 10,
+            "relay_srtp_session_missing" => 11,
+            "relay_srtp_protect_failed" => 12,
+            _ => unreachable!("unknown media error boundary"),
+        };
+        &self.error_log[index]
+    }
+
+    fn log_drop(&self, stage: &'static str, bytes: usize, direction: &'static str) {
+        let window = if stage == "srtp_session_pending_buffered" {
+            &self.pending_log
+        } else {
+            self.error_window(stage)
+        };
+        if let Some(suppressed) = window.observe() {
+            self.transport.with_log_context(|| tracing::info!(parent: &self.transport.log_span, event = "media.transport_drop", session_id = self.transport.label.as_deref(),
+                outcome = if stage == "srtp_session_pending_buffered" { "buffered" } else { "dropped" },
+                direction, stage, local_addr = %self.local_addr(), configured_peer_addr = %self.remote_addr(),
+                datagram_bytes = bytes, suppressed, "media transport drop"));
+        }
+    }
+
     pub fn received_rtp_packets(&self) -> u64 {
         self.received_rtp_packets.load(Ordering::Relaxed)
     }
@@ -960,6 +1001,7 @@ impl RtpTransport {
             let mut protected = vec![0; srtp.protected_rtp_len(&packet)];
             srtp.protect_rtp(&packet, &mut protected).inspect_err(|_| {
                 self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
+                self.log_drop("srtp_protect_failed", packet.encoded_len(), "local_to_peer");
             })?;
             protected
         };
@@ -1055,6 +1097,7 @@ impl RtpTransport {
                     }
                     srtp.protect_rtp(&packet, out).inspect_err(|_| {
                         self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
+                        self.log_drop("srtp_protect_failed", packet.encoded_len(), "local_to_peer");
                     })?;
                     (SendBuf::Caller(out), len)
                 }
@@ -1062,6 +1105,7 @@ impl RtpTransport {
                     let mut owned = vec![0; len];
                     srtp.protect_rtp(&packet, &mut owned).inspect_err(|_| {
                         self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
+                        self.log_drop("srtp_protect_failed", packet.encoded_len(), "local_to_peer");
                     })?;
                     (SendBuf::Owned(owned), len)
                 }
@@ -1069,6 +1113,7 @@ impl RtpTransport {
         } else {
             if self.srtp_required {
                 self.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed);
+                self.log_drop("srtp_send_session_missing", packet.encoded_len(), "local_to_peer");
                 debug!(
                     "RtpTransport: SRTP required but session not ready, dropping RTP send"
                 );
@@ -1208,13 +1253,8 @@ impl RtpTransport {
                 marshal_buf.resize(protected_len, 0);
                 if srtp.protect_rtp(&packet, &mut marshal_buf[..]).is_err() {
                     let failures = target.srtp_protect_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                    if failures <= 3 || failures.is_multiple_of(100) {
-                        tracing::warn!(
-                            failures,
-                            ssrc = packet.header.ssrc,
-                            "relay: SRTP protect_rtp failed, dropping"
-                        );
-                    }
+                    let _ = failures; // retain vendor cumulative counter
+                    target.log_drop("relay_srtp_protect_failed", _packet_len, "local_to_peer");
                     return None; // drop on protect error
                 }
             } else if target.srtp_required {
@@ -1222,13 +1262,8 @@ impl RtpTransport {
                     .srtp_dropped_no_session
                     .fetch_add(1, Ordering::Relaxed)
                     + 1;
-                if failures <= 3 || failures.is_multiple_of(100) {
-                    tracing::debug!(
-                        failures,
-                        ssrc = packet.header.ssrc,
-                        "relay: target SRTP required but session not ready, dropping"
-                    );
-                }
+                let _ = failures;
+                target.log_drop("relay_srtp_session_missing", _packet_len, "local_to_peer");
                 return None; // session not ready → drop
             } else {
                 packet.marshal_into(marshal_buf);
@@ -1322,6 +1357,7 @@ impl PacketReceiver for RtpTransport {
                                 Bytes::from(buf)
                             }
                             Err(e) => {
+                                self.log_drop("srtcp_unprotect_failed", _packet_len, "peer_to_local");
                                 debug!("SRTP unprotect RTCP failed: {}", e);
                                 return;
                             }
@@ -1347,12 +1383,14 @@ impl PacketReceiver for RtpTransport {
                 match parse_rtcp_packets(&unprotected, Some(addr)) {
                     Ok(packets) => {
                         if try_send_with_fallback(&tx, packets).await.is_err() {
+                            self.log_drop("rtcp_listener_closed", _packet_len, "peer_to_local");
                             let mut guard = self.rtcp_listener.lock();
                             *guard = None;
                         } else {
                         }
                     }
                     Err(e) => {
+                        self.log_drop("rtcp_parse_failed", _packet_len, "peer_to_local");
                         trace!("RTCP parse failed: {}", e);
                     }
                 }
@@ -1403,22 +1441,24 @@ impl RtpTransport {
                                         .srtp_unprotect_failures
                                         .fetch_add(1, Ordering::Relaxed)
                                         + 1;
-                                    if failures <= 5 || failures.is_multiple_of(100) {
-                                        tracing::warn!(
-                                            failures,
+                                    if let Some(suppressed) = self.error_window("srtp_unprotect_failed").observe() {
+                                        self.transport.with_log_context(|| tracing::warn!(parent: &self.transport.log_span,
+                                            suppressed, event = "media.transport_drop", session_id = self.transport.label.as_deref(),
+                                            direction = "peer_to_local", stage = "srtp_unprotect_failed", failures,
                                             from = %addr,
                                             ssrc,
                                             payload_type,
                                             sequence,
                                             %error,
                                             "SRTP unprotect RTP failed, dropping"
-                                        );
+                                        ));
                                     }
                                     return;
                                 }
                             }
                         }
                         Err(e) => {
+                            self.log_drop("srtp_parse_failed", _packet_len, "peer_to_local");
                             trace!("SRTP parse failed: {}", e);
                             return;
                         }
@@ -1430,12 +1470,14 @@ impl RtpTransport {
                         // ready (peer greeting during our handshake):
                         // buffer it (bounded) for replay instead of
                         // dropping it.
+                        self.log_drop("srtp_session_pending_buffered", packet.len(), "peer_to_local");
                         self.buffer_pending_srtp(packet, addr);
                         return;
                     }
                     match RtpPacket::parse_bytes(packet) {
                         Ok(rtp_packet) => rtp_packet,
                         Err(e) => {
+                            self.log_drop("rtp_parse_failed", _packet_len, "peer_to_local");
                             trace!("RTP parse failed: {}", e);
                             return;
                         }
@@ -1447,7 +1489,15 @@ impl RtpTransport {
         // Count every accepted inbound RTP packet at the transport layer.
         // This runs before the rewrite-bridge fast-path early-return, so
         // the counter advances for both relayed and depacketized packets.
-        self.received_rtp_packets.fetch_add(1, Ordering::Relaxed);
+        if self.received_rtp_packets.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.transport.with_log_context(|| {
+                tracing::info!(parent: &self.transport.log_span,
+                event = "media.transport", session_id = self.transport.label.as_deref(),
+                direction = "peer_to_local", stage = "rtp_accepted", from = %addr,
+                ssrc = rtp_packet.header.ssrc, payload_type = rtp_packet.header.payload_type,
+                "first RTP packet accepted after parse/decrypt")
+            });
+        }
 
         // Ingress observation: fire on the plaintext packet BEFORE the
         // relay fast-path early-return, so observers (stats/DTMF/recording)
@@ -1534,14 +1584,17 @@ impl RtpTransport {
                 Ok(()) => {
                 }
                 Err(mpsc::TrySendError::Full(_)) => {
+                    self.log_drop("rtp_listener_full", _packet_len, "peer_to_local");
                 }
                 Err(mpsc::TrySendError::Closed(_)) => {
+                    self.log_drop("rtp_listener_closed", _packet_len, "peer_to_local");
                     let mut listeners = self.listeners.lock();
                     listeners.by_ssrc.remove(&ssrc);
                     listeners.remove_sender(&tx);
                 }
             }
         } else {
+            self.log_drop("rtp_listener_missing", _packet_len, "peer_to_local");
             trace!(
                 "No listener found for packet SSRC: {} PT: {} from {}",
                 ssrc, pt, addr
