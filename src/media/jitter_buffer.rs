@@ -237,21 +237,26 @@ impl JitterBuffer {
         self.frames(self.min_delay).max(1)
     }
 
-    /// Samples `tick` buffers at most.
+    /// Media samples `tick` buffers at most; control packets have no duration.
     fn max_frames(&self) -> usize {
         (self.max_delay.as_micros() / self.ptime.as_micros().max(1)) as usize
     }
 
     /// Drop the oldest buffered sample (in sequence order, across
     /// wraparound), its slot given up.
-    fn drop_oldest(&mut self) {
+    fn drop_oldest(&mut self) -> bool {
         if let Some(oldest) = self.get_first_seq() {
-            self.samples.remove(&oldest);
+            let media = self
+                .samples
+                .remove(&oldest)
+                .is_some_and(|buffered| !buffered.control);
             self.stats.dropped += 1;
             if self.playing {
                 self.last_delivered_seq = Some(oldest);
             }
+            return media;
         }
+        false
     }
 
     /// Take the sample due on a playout clock: call once per
@@ -270,14 +275,23 @@ impl JitterBuffer {
             self.above_target_ticks = 0;
         }
 
+        // Control packets share sequence ordering, but represent no playout
+        // duration. Keep the hard packet-count capacity in push_inner.
+        let mut media_frames = self
+            .samples
+            .values()
+            .filter(|buffered| !buffered.control)
+            .count();
         let max_frames = self.max_frames().max(self.target_frames() + 1);
-        while self.samples.len() > max_frames {
-            self.drop_oldest();
+        while media_frames > max_frames {
+            if self.drop_oldest() {
+                media_frames -= 1;
+            }
         }
 
         // delay grown by underruns (or a sender clock running fast): once
         // well above target for long, drop a sample to win it back
-        if self.samples.len() > self.target_frames() + 1 {
+        if media_frames > self.target_frames() + 1 {
             self.above_target_ticks += 1;
         } else {
             self.above_target_ticks = 0;
@@ -808,7 +822,13 @@ mod tests {
         for clock_rate in [8000, 48000] {
             for origin in [100_000u32, u32::MAX - 100] {
                 for clocked in [false, true] {
-                    let mut jb = JitterBuffer::new(Duration::ZERO, Duration::from_secs(1), 32);
+                    // Tight latency and rapid adaptive trimming independently
+                    // enforce media duration, not the number of control packets.
+                    let mut jb = JitterBuffer::new(Duration::ZERO, Duration::from_millis(120), 32);
+                    jb.set_playout_config(PlayoutConfig {
+                        trim_after: Duration::from_millis(20),
+                        ..Default::default()
+                    });
                     let audio = |seq, timestamp| {
                         let mut sample = make_sample_with_ssrc(seq, 7, timestamp);
                         if let MediaSample::Audio(f) = &mut sample {
@@ -1081,13 +1101,21 @@ mod tests {
 
     #[test]
     fn tick_drops_the_oldest_beyond_max_delay() {
-        let mut jb = playout();
-        for seq in 0..12 {
-            jb.push(make_sample(seq));
+        for with_control in [false, true] {
+            let mut jb = playout();
+            for seq in 0..12 {
+                jb.push(make_sample(seq));
+            }
+            if with_control {
+                for seq in 12..16 {
+                    jb.push_control(make_sample(seq));
+                }
+            }
+            // 200 ms at 20 ms: retain at most 10 media samples, regardless
+            // of control packets. Real excess media still gets discarded.
+            assert_eq!(tick(&mut jb), S(2));
+            assert_eq!(jb.stats().dropped, 2);
         }
-        // 200 ms at 20 ms: 10 samples
-        assert_eq!(tick(&mut jb), S(2));
-        assert_eq!(jb.stats().dropped, 2);
     }
 
     #[test]
