@@ -1,4 +1,4 @@
-> This is `fork-rustrtc 0.6.5-rc.1`, based on upstream rustrtc v0.6.5
+> This is `fork-rustrtc 0.6.5-rc.2`, based on upstream rustrtc v0.6.5
 > (`6ade65055900cd3228160224ab75aac9e230ede9`). Package source:
 > https://github.com/dengxiayehu/rustrtc
 >
@@ -9,7 +9,8 @@
 > be supplied by the application. First errors remain immediate; first-success
 > logs remain one-shot. Media transports retain their owning connection span,
 > including independent video transports. Business session/SIP Call-ID mapping
-> remains the application's responsibility. No new runtime feature is required.
+> remains the application's responsibility. PeerConnection closes its event
+> queue once, wakes all waiters, and drains live events before returning EOF.
 
 # rustrtc
 

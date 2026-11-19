@@ -209,4 +209,17 @@ fn two_no_std_pcs_exchange_data_channels() {
         30_000,
     );
     assert!(got, "pc1 must receive the reverse cmd payload");
+
+    drive(
+        async {
+            let mut parked = Box::pin(pc1.recv());
+            assert!(futures::poll!(&mut parked).is_pending());
+            pc1.close();
+            assert!(pc1.recv().await.is_none());
+            assert!(parked.await.is_none());
+        },
+        5_000,
+    )
+    .expect("every no_std recv must see EOF without another waiter making progress");
+    pc2.close();
 }
