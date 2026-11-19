@@ -1,6 +1,6 @@
-> This is `fork-rustrtc 0.6.4`, based on upstream rustrtc v0.6.4
-> (`076dbe7ad2fc01af6518efe0037256127d9f5530`). Package source:
-> https://github.com/dengxiayehu/rustrtc/tree/release/fork-rustrtc-0.6.4
+> This is `fork-rustrtc 0.6.5-rc.1`, based on upstream rustrtc v0.6.5
+> (`6ade65055900cd3228160224ab75aac9e230ede9`). Package source:
+> https://github.com/dengxiayehu/rustrtc
 >
 > Retained patches: established local re-offer rollback; correlated, rate-limited
 > transport diagnostics; atomic RTP sequence allocation for audio/DTMF; control

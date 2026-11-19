@@ -1,10 +1,10 @@
 [package]
 name = "fork-rustrtc"
-version = "0.6.5"
+version = "0.6.5-rc.1"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/dengxiayehu/rustrtc"
-description = "rustrtc 0.6.4 fork with correlated media diagnostics and client negotiation fixes"
+description = "rustrtc 0.6.5 fork with correlated media diagnostics and client negotiation fixes"
 readme = "README.md"
 keywords = ["rtp", "srtp", "webrtc", "fax", "turn"]
 categories = ["network-programming"]
